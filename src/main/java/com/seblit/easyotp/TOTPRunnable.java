@@ -1,0 +1,142 @@
+package com.seblit.easyotp;
+
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+
+/**
+ * A {@link Runnable} using an {@link OTPGenerator} to continuously generate TOTPs for the systems current time.<br>
+ * Use {@link Callback} to be notified about new TOTPs being generated.<br>
+ * Use {@link ErrorCallback} to be notified about any errors that may occur during {@link OTPGenerator#generate(TOTPSpec, long)}.<br>
+ * ErrorCallbacks are optional. If none is provided, errors will be wrapped in a {@link RuntimeException} and rethrown
+ *
+ * @see System#currentTimeMillis()
+ * @see OTPGenerator
+ * @see TOTPSpec
+ */
+public class TOTPRunnable implements Runnable {
+
+    private boolean isCanceled = false;
+    private final Object monitor = new Object();
+    private final TOTPSpec spec;
+    private final Callback callback;
+    private final ErrorCallback errorCallback;
+    private final OTPGenerator generator;
+
+    /**
+     * Creates a new instance. No {@link ErrorCallback} is provided to this instance
+     *
+     * @param spec     The {@link TOTPSpec} that is used for OTP generation
+     * @param callback The {@link Callback} that will be notified, whenever a new TOTP as generated
+     */
+    public TOTPRunnable(@NotNull TOTPSpec spec, @NotNull Callback callback) {
+        this(spec, callback, null);
+    }
+
+    /**
+     * Creates a new instance
+     *
+     * @param spec          The {@link TOTPSpec} that is used for OTP generation
+     * @param callback      The {@link Callback} that will be notified, whenever a new TOTP as generated
+     * @param errorCallback The {@link ErrorCallback} that will be notified, whenever an error occurred during {@link OTPGenerator#generate(TOTPSpec, long)}.
+     *                      May be null. If no callback is provided, errors will be wrapped in a {@link RuntimeException} and rethrown
+     */
+    public TOTPRunnable(@NotNull TOTPSpec spec, @NotNull Callback callback, @Nullable ErrorCallback errorCallback) {
+        this(spec, callback, errorCallback, new OTPGenerator());
+    }
+
+    /**
+     * Creates a new instance
+     *
+     * @param spec          The {@link TOTPSpec} that is used for OTP generation
+     * @param callback      The {@link Callback} that will be notified, whenever a new TOTP as generated
+     * @param errorCallback The {@link ErrorCallback} that will be notified, whenever an error occurred during {@link OTPGenerator#generate(TOTPSpec, long)}.
+     *                      May be null. If no callback is provided, errors will be wrapped in a {@link RuntimeException} and rethrown
+     * @param generator     The {@link OTPGenerator} that is used for OTP generation
+     */
+    public TOTPRunnable(@NotNull TOTPSpec spec, @NotNull Callback callback, @Nullable ErrorCallback errorCallback, OTPGenerator generator) {
+        this.spec = spec;
+        this.callback = callback;
+        this.errorCallback = errorCallback;
+        this.generator = generator;
+    }
+
+    /**
+     * This method will block until {@link #cancel()} has been called or the calling Thread has been interrupted.<br>
+     * A TOTP will be generated based on {@link System#currentTimeMillis()} and the provided {@link TOTPSpec} using {@link OTPGenerator#generate(TOTPSpec, long)}.
+     * Newly generated TOTPs will then be forwarded to the provided {@link Callback}.<br>
+     * After generation this method will {@link Object#wait(long) wait} until the current TOTP has expired, {@link #cancel()} is called or the calling Thread is interrupted.<br>
+     * If conditions are still met, the cycle will repeat and the next TOTP is generated. Otherwise, this method returns.
+     */
+    @Override
+    public void run() {
+        while (!isCanceled && !Thread.currentThread().isInterrupted()) {
+            long utcTimestamp = System.currentTimeMillis();
+            try {
+                callback.onOTPChanged(generator.generate(spec, utcTimestamp), spec, utcTimestamp);
+            } catch (Throwable error) {
+                if (errorCallback == null) {
+                    if (error instanceof RuntimeException) {
+                        throw (RuntimeException) error;
+                    }
+                    throw new RuntimeException("Failed generating OTP", error);
+                }
+                if (errorCallback.onError(error, spec, utcTimestamp)) {
+                    isCanceled = true;
+                    return;
+                }
+            }
+            synchronized (monitor) {
+                long remainingTime = System.currentTimeMillis() % spec.getPeriodMillis();
+                if (!isCanceled) {
+                    try {
+                        monitor.wait(remainingTime);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Cancels this runnable, after which no further TOTPs will be generated by it.<br>
+     * If the {@link #run()} method is currently active, it will abort its work and return.
+     */
+    public void cancel() {
+        synchronized (monitor) {
+            isCanceled = true;
+            monitor.notifyAll();
+        }
+    }
+
+    /**
+     * Callback used by {@link TOTPRunnable} to notify about errors that occurred during TOTP generation
+     */
+    public interface ErrorCallback {
+        /**
+         * Called when an error occurred during {@link OTPGenerator#generate(TOTPSpec, long)}. Called on the Thread that is executing {@link #run()}.
+         *
+         * @param error        The error that occurred
+         * @param spec         The {@link TOTPSpec} used for TOTP generation
+         * @param utcTimestamp The UTC timestamp that was used for TOTP generation
+         * @return true if this runnable should be canceled. false if it should continue generating TOTPs after waiting for expiration of the current period
+         */
+        boolean onError(@NotNull Throwable error, TOTPSpec spec, long utcTimestamp);
+    }
+
+    /**
+     * Callback used by {@link TOTPRunnable} to notify about newly generated TOTPs
+     */
+    public interface Callback {
+        /**
+         * Called when a new TOTP has been generated. Called on the Thread that is executing {@link #run()}.
+         *
+         * @param totp         The TOTP that has been generated
+         * @param spec         The {@link TOTPSpec} used for TOTP generation
+         * @param utcTimestamp The UTC timestamp that was used for TOTP generation
+         */
+        void onOTPChanged(@NotNull String totp, @NotNull TOTPSpec spec, long utcTimestamp);
+    }
+
+}
